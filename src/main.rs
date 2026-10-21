@@ -146,7 +146,9 @@ fn main() -> ferriscope::Result<()> {
 			touch_click_mode: ferriscope::TouchClickMode::from_raw(cli.default_touch_mode),
 			cursor_hide_time: std::time::Duration::from_millis(cli.cursor_hide_time),
 		},
-		// The binary has no DMA-BUF consumer: frames are read back and recorded.
+		// The binary has no DMA-BUF consumer: frames are read back and recorded,
+		// so any renderable format will do.
+		frame_formats: None,
 		output: ferriscope::FrameOutput::Recorder(ferriscope::RecorderOutput {
 			dir: cli.record_dir,
 			max_frames: cli.record_max_frames,

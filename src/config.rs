@@ -9,7 +9,7 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use crate::{cursor::DEFAULT_CURSOR_HIDE_TIME, keyboard::KeyboardConfig, touch::TouchClickMode};
+use crate::{Format, cursor::DEFAULT_CURSOR_HIDE_TIME, keyboard::KeyboardConfig, touch::TouchClickMode};
 
 /// Default [`ChannelOutput::pool_size`].
 pub(crate) const DEFAULT_POOL_SIZE: usize = 3;
@@ -66,6 +66,16 @@ pub struct CompositorConfig {
 	pub seat: SeatConfig,
 	/// Where composited frames go and how they are produced.
 	pub output: FrameOutput,
+	/// The DMA-BUF formats and modifiers the embedder can import frames in;
+	/// `None` for any the renderer can draw into.
+	///
+	/// The pool allocates frames only in these, and a lone fullscreen client
+	/// buffer is passed through only in one of them, otherwise composited, so
+	/// neither a driver nor a client can hand the embedder a layout its
+	/// consumer rejects: a Vulkan encoder imports only the modifiers
+	/// `VkDrmFormatModifierPropertiesListEXT` lists for the format, which on
+	/// NVIDIA leaves out the compressed ones the GL driver renders into.
+	pub frame_formats: Option<Vec<Format>>,
 	/// Unix socket the compositor connects to for the text input control
 	/// stream (see the `control` module); `None` for no control stream.
 	///
@@ -89,6 +99,7 @@ impl Default for CompositorConfig {
 			hdr: false,
 			seat: SeatConfig::default(),
 			output: FrameOutput::default(),
+			frame_formats: None,
 			#[cfg(feature = "test-support")]
 			control_socket: None,
 		}

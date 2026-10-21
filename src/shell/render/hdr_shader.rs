@@ -331,7 +331,7 @@ mod gpu_tests {
 			.expect("import the texture");
 
 		let format =
-			crate::shell::render::elements::pick_hdr_format(&renderer, output).expect("a renderable HDR format");
+			crate::shell::render::elements::pick_hdr_format(&renderer, output, None).expect("a renderable HDR format");
 		let mut dmabuf = target(&mut allocator, &format);
 		{
 			let mut bound = renderer.bind(&mut dmabuf).expect("bind the target");

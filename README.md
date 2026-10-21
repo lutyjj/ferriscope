@@ -92,7 +92,8 @@ let ready = handles.ready.recv().expect("compositor ready");
 producer handle and the consumer endpoints (`CompositorHandles`).
 `ferriscope::run(config)` is the standalone form. Frames are composited to
 RGB, except that a lone opaque, output-sized client DMA-BUF with nothing drawn
-over it is handed over as-is (zero-copy passthrough). `handles.frames` keeps
+over it, in a format the embedder lists (`CompositorConfig::frame_formats`), is
+handed over as-is (zero-copy passthrough). `handles.frames` keeps
 only the newest undelivered one.
 The `test-support` feature (CPU PPM recorder, control socket) is enabled by the
 binary and the tests; embedders leave it off.

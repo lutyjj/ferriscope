@@ -51,8 +51,9 @@ impl FerriscopeState {
 	}
 
 	/// Make the pool hold `content`'s encoding: HDR10 PQ as `Abgr2101010`, scRGB
-	/// as `Abgr16161616f`, anything else (or HDR with HDR disabled, or a
-	/// renderer without the format) as the 8-bit SDR format. Returns the
+	/// as `Abgr16161616f`, anything else (or HDR with HDR disabled, or a format
+	/// the renderer cannot draw into or the embedder cannot import) as the 8-bit
+	/// SDR format. Returns the
 	/// encoding in effect.
 	///
 	/// A switch drops every pool slot and the damage ages with it: a buffer of
@@ -70,12 +71,15 @@ impl FerriscopeState {
 		}
 		let format = match wanted {
 			ContentKind::Sdr => Some(self.sdr_format.clone()),
-			hdr => pick_hdr_format(&self.renderer, hdr),
+			hdr => pick_hdr_format(&self.renderer, hdr, self.frame_formats.as_deref()),
 		};
 		let Some(format) = format else {
 			if !self.hdr_format_warned {
 				self.hdr_format_warned = true;
-				tracing::warn!(encoding = ?wanted, "the renderer cannot draw this HDR format; staying SDR");
+				tracing::warn!(
+					encoding = ?wanted,
+					"the renderer cannot draw this HDR format, or the embedder cannot import it; staying SDR"
+				);
 			}
 			return self.output_encoding;
 		};

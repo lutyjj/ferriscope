@@ -48,7 +48,7 @@ pub(in crate::shell) fn window_surface_ids(root: &WlSurface, ids: &mut HashSet<I
 }
 
 /// A pool buffer format: a fourcc and every modifier the renderer can render
-/// into with it.
+/// into with it, and the embedder can import.
 ///
 /// The allocator gets the whole list and the driver picks per allocation. A
 /// modifier can be renderable yet not allocatable at every size: on AMD GFX10
@@ -64,18 +64,20 @@ pub(in crate::shell) struct RenderFormat {
 }
 
 impl RenderFormat {
-	/// `code` with its renderable modifiers from `set`, if it has any.
-	fn from_set(set: &FormatSet, code: Fourcc) -> Option<Self> {
+	/// `code` with its modifiers from the renderable `set` that `importable`,
+	/// the embedder's formats, also has, if any.
+	fn from_set(set: &FormatSet, code: Fourcc, importable: Option<&[Format]>) -> Option<Self> {
+		let usable = |format: &Format| format.code == code && importable.is_none_or(|formats| formats.contains(format));
 		let mut modifiers: Vec<Modifier> = set
 			.iter()
-			.filter(|format| format.code == code && format.modifier != Modifier::Invalid)
+			.filter(|format| usable(format) && format.modifier != Modifier::Invalid)
 			.map(|format| format.modifier)
 			.collect();
 		if modifiers.is_empty() {
-			if !set.contains(&Format {
-				code,
-				modifier: Modifier::Invalid,
-			}) {
+			if !set
+				.iter()
+				.any(|format| usable(format) && format.modifier == Modifier::Invalid)
+			{
 				return None;
 			}
 			modifiers.push(Modifier::Invalid);
@@ -84,28 +86,47 @@ impl RenderFormat {
 	}
 }
 
-/// Pick a format the renderer can render into as a DMA-BUF.
-pub(in crate::shell) fn pick_render_format(renderer: &GlesRenderer) -> Result<RenderFormat> {
+/// Pick a format the renderer can render into as a DMA-BUF, and the embedder
+/// can import ([`crate::CompositorConfig::frame_formats`]).
+pub(in crate::shell) fn pick_render_format(
+	renderer: &GlesRenderer,
+	importable: Option<&[Format]>,
+) -> Result<RenderFormat> {
 	let set = <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer)
 		.ok_or_else(|| Error::Gpu("renderer exposes no dmabuf render formats".into()))?;
-	[Fourcc::Abgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888]
+	[Fourcc::Abgr8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888]
 		.into_iter()
-		.chain(set.iter().next().map(|format| format.code))
-		.find_map(|code| RenderFormat::from_set(&set, code))
-		.ok_or_else(|| Error::Gpu("dmabuf render format set is empty".into()))
+		// Without a list, any renderable format will do; with one, only 8-bit.
+		.chain(
+			importable
+				.is_none()
+				.then(|| set.iter().next().map(|format| format.code))
+				.flatten(),
+		)
+		.find_map(|code| RenderFormat::from_set(&set, code, importable))
+		.ok_or_else(|| match importable {
+			None => Error::Gpu("dmabuf render format set is empty".into()),
+			Some(_) => Error::Gpu("no 8-bit dmabuf format is both renderable and importable by the embedder".into()),
+		})
 }
 
 /// The render target format for HDR output of `kind`, if the renderer can draw
-/// into one: 10-bit for PQ, FP16 for scRGB (ABGR/XBGR 2101010 and 16161616F),
-/// layouts a Vulkan video encoder can import.
-pub(in crate::shell) fn pick_hdr_format(renderer: &GlesRenderer, kind: ContentKind) -> Option<RenderFormat> {
+/// into one the embedder can import: 10-bit for PQ, FP16 for scRGB (ABGR/XBGR
+/// 2101010 and 16161616F), layouts a Vulkan video encoder can import.
+pub(in crate::shell) fn pick_hdr_format(
+	renderer: &GlesRenderer,
+	kind: ContentKind,
+	importable: Option<&[Format]>,
+) -> Option<RenderFormat> {
 	let codes = match kind {
 		ContentKind::Sdr => return None,
 		ContentKind::Pq => [Fourcc::Abgr2101010, Fourcc::Xbgr2101010],
 		ContentKind::ScRgb => [Fourcc::Abgr16161616f, Fourcc::Xbgr16161616f],
 	};
 	let set = <GlesRenderer as Bind<Dmabuf>>::supported_formats(renderer)?;
-	codes.into_iter().find_map(|code| RenderFormat::from_set(&set, code))
+	codes
+		.into_iter()
+		.find_map(|code| RenderFormat::from_set(&set, code, importable))
 }
 
 render_elements! {
@@ -178,6 +199,45 @@ mod gpu_tests {
 
 	use super::*;
 
+	fn format(code: Fourcc, modifier: u64) -> Format {
+		Format {
+			code,
+			modifier: Modifier::from(modifier),
+		}
+	}
+
+	/// The embedder's formats leave out modifiers it cannot import, as NVIDIA's
+	/// Vulkan driver does with the compressed layouts its GL driver renders into.
+	#[test]
+	fn only_modifiers_the_embedder_imports_are_allocated() {
+		const COMPRESSED: u64 = 0x0300_0000_00e0_8014;
+		const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6010;
+		let renderable: FormatSet = [
+			format(Fourcc::Abgr8888, COMPRESSED),
+			format(Fourcc::Abgr8888, BLOCK_LINEAR),
+			format(Fourcc::Abgr8888, 0),
+			format(Fourcc::Xrgb8888, u64::from(Modifier::Invalid)),
+		]
+		.into_iter()
+		.collect();
+		let any = RenderFormat::from_set(&renderable, Fourcc::Abgr8888, None).unwrap();
+		assert_eq!(any.modifiers.len(), 3);
+
+		let importable = [format(Fourcc::Abgr8888, BLOCK_LINEAR), format(Fourcc::Abgr8888, 0)];
+		let picked = RenderFormat::from_set(&renderable, Fourcc::Abgr8888, Some(&importable)).unwrap();
+		assert_eq!(picked.modifiers, [Modifier::from(BLOCK_LINEAR), Modifier::Linear]);
+
+		// An implicit layout is allocated only if the embedder lists it.
+		assert!(RenderFormat::from_set(&renderable, Fourcc::Xrgb8888, Some(&importable)).is_none());
+		let implicit = [format(Fourcc::Xrgb8888, u64::from(Modifier::Invalid))];
+		let picked = RenderFormat::from_set(&renderable, Fourcc::Xrgb8888, Some(&implicit)).unwrap();
+		assert_eq!(picked.modifiers, [Modifier::Invalid]);
+
+		// Nothing in common: no format.
+		let other = [format(Fourcc::Abgr8888, 0x0300_0000_0060_6011)];
+		assert!(RenderFormat::from_set(&renderable, Fourcc::Abgr8888, Some(&other)).is_none());
+	}
+
 	/// Every picked format allocates above 2560x2560, where AMD GFX10/GFX11
 	/// reject the driver's preferred DCC modifier.
 	#[test]
@@ -193,9 +253,9 @@ mod gpu_tests {
 		let renderer = unsafe { GlesRenderer::new(context) }.expect("gles");
 		let mut allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
 
-		let formats = std::iter::once(pick_render_format(&renderer).expect("an SDR format"))
-			.chain(pick_hdr_format(&renderer, ContentKind::Pq))
-			.chain(pick_hdr_format(&renderer, ContentKind::ScRgb));
+		let formats = std::iter::once(pick_render_format(&renderer, None).expect("an SDR format"))
+			.chain(pick_hdr_format(&renderer, ContentKind::Pq, None))
+			.chain(pick_hdr_format(&renderer, ContentKind::ScRgb, None));
 		for format in formats {
 			for (width, height) in [(3840, 2160), (3840, 2400), (5120, 2880)] {
 				allocator

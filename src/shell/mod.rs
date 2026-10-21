@@ -281,6 +281,8 @@ pub struct FerriscopeState {
 	wayland_display: String,
 	/// Whether the session can produce HDR frames ([`CompositorConfig::hdr`]).
 	hdr: bool,
+	/// The formats the embedder can import ([`CompositorConfig::frame_formats`]).
+	frame_formats: Option<Vec<crate::Format>>,
 	/// External stop request from [`crate::compositor::Compositor::stop`].
 	external_stop: Arc<AtomicBool>,
 	xwm: Option<X11Wm>,
@@ -419,7 +421,7 @@ impl FerriscopeState {
 		let context = EGLContext::new(&display_egl).map_err(|e| Error::Gpu(format!("egl context: {e:?}")))?;
 		let mut renderer = unsafe { GlesRenderer::new(context) }.map_err(|e| Error::Gpu(format!("gles: {e:?}")))?;
 		let allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
-		let render_format = pick_render_format(&renderer)?;
+		let render_format = pick_render_format(&renderer, config.frame_formats.as_deref())?;
 		let sdr_program = if config.hdr {
 			Some(render::hdr_shader::compile(&mut renderer)?)
 		} else {
@@ -550,6 +552,7 @@ impl FerriscopeState {
 		let cursor_hide_time = config.seat.cursor_hide_time;
 		let touch_click_mode = config.seat.touch_click_mode;
 		let config_hdr = config.hdr;
+		let frame_formats = config.frame_formats.clone();
 		let colour_globals = ColourManagementGlobals::new(&display_handle, config_hdr);
 
 		let mut state = Self {
@@ -632,6 +635,7 @@ impl FerriscopeState {
 			ready: Some(ready),
 			wayland_display,
 			hdr: config_hdr,
+			frame_formats,
 			external_stop: stop,
 			xwm: None,
 			action_binding_global,

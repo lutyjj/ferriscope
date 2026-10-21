@@ -18,7 +18,7 @@
 
 use smithay::{
 	backend::{
-		allocator::{Buffer as _, Fourcc, dmabuf::Dmabuf, format::has_alpha},
+		allocator::{Buffer as _, Format, Fourcc, dmabuf::Dmabuf, format::has_alpha},
 		renderer::utils::{Buffer, RendererSurfaceStateUserData, with_renderer_surface_state},
 	},
 	desktop::PopupManager,
@@ -49,7 +49,8 @@ pub(in crate::shell) enum Blocker {
 	/// The buffer is not a DMA-BUF.
 	NotDmabuf,
 	/// The buffer's format is not one the consumer takes for the window's
-	/// colour (8-bit RGB for SDR; 10-bit or FP16 only for matching HDR content).
+	/// colour (8-bit RGB for SDR; 10-bit or FP16 only for matching HDR content),
+	/// or its layout is not one the embedder lists.
 	UnsupportedFormat,
 	/// The buffer size differs from the output, or a scale, crop or transform
 	/// would be applied.
@@ -76,7 +77,8 @@ pub(in crate::shell) struct Conditions {
 	pub(in crate::shell) full_output: bool,
 	/// The current buffer is a DMA-BUF.
 	pub(in crate::shell) buffer_is_dmabuf: bool,
-	/// The DMA-BUF format is one the consumer takes for the window's content.
+	/// The DMA-BUF format is one the consumer takes for the window's content,
+	/// in a layout it can import ([`crate::CompositorConfig::frame_formats`]).
 	pub(in crate::shell) format_supported: bool,
 	/// The buffer is output-sized with scale 1, no crop and no transform.
 	pub(in crate::shell) identity_transform: bool,
@@ -132,6 +134,12 @@ pub(in crate::shell) fn format_supported(format: Fourcc, content: ContentKind, h
 		ContentKind::Pq => hdr_enabled && matches!(format, Fourcc::Abgr2101010 | Fourcc::Xbgr2101010),
 		ContentKind::ScRgb => hdr_enabled && matches!(format, Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f),
 	}
+}
+
+/// Whether the embedder can import a buffer in `format`: it lists the format and
+/// modifier ([`crate::CompositorConfig::frame_formats`]), or lists none.
+pub(in crate::shell) fn embedder_imports(format: Format, importable: Option<&[Format]>) -> bool {
+	importable.is_none_or(|formats| formats.contains(&format))
 }
 
 /// Whether `regions` (disjoint, as smithay keeps them) cover all of `size`.
@@ -252,8 +260,11 @@ impl FerriscopeState {
 		// The frame is labelled with the encoding `frame_info` settles on, which
 		// is HDR only where the renderer can also draw it.
 		let content = surface_content_colour(&surface).kind;
-		let hdr_output = self.hdr && (!content.is_hdr() || pick_hdr_format(&self.renderer, content).is_some());
-		conditions.format_supported = format_supported(dmabuf.format().code, content, hdr_output);
+		let importable = self.frame_formats.as_deref();
+		let hdr_output =
+			self.hdr && (!content.is_hdr() || pick_hdr_format(&self.renderer, content, importable).is_some());
+		conditions.format_supported = format_supported(dmabuf.format().code, content, hdr_output)
+			&& embedder_imports(dmabuf.format(), importable);
 		conditions.identity_transform =
 			identity && dmabuf.width() == self.frame_size.w as u32 && dmabuf.height() == self.frame_size.h as u32;
 		(conditions, Some(Candidate { buffer, dmabuf }))
@@ -274,6 +285,8 @@ impl FerriscopeState {
 
 #[cfg(test)]
 mod tests {
+	use smithay::backend::allocator::Modifier;
+
 	use super::*;
 
 	fn eligible() -> Conditions {
@@ -381,6 +394,22 @@ mod tests {
 		assert!(format_supported(Fourcc::Abgr8888, ContentKind::Sdr, true));
 		assert!(!format_supported(Fourcc::Abgr2101010, ContentKind::Sdr, true));
 		assert!(!format_supported(Fourcc::Abgr16161616f, ContentKind::Sdr, true));
+	}
+
+	#[test]
+	fn a_listed_layout_passes_and_any_passes_without_a_list() {
+		let linear = Format {
+			code: Fourcc::Xrgb8888,
+			modifier: Modifier::Linear,
+		};
+		// A compressed NVIDIA layout of the same format.
+		let compressed = Format {
+			code: Fourcc::Xrgb8888,
+			modifier: Modifier::from(0x0300_0000_00e0_8014),
+		};
+		assert!(embedder_imports(compressed, None));
+		assert!(embedder_imports(linear, Some(&[linear])));
+		assert!(!embedder_imports(compressed, Some(&[linear])));
 	}
 
 	#[test]

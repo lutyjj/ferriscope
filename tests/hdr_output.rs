@@ -23,8 +23,8 @@ use std::{
 };
 
 use ferriscope::{
-	ColourMetadata, ColourPrimaries, Compositor, CompositorConfig, CompositorHandles, DmaBufFrame, Fourcc, Frame,
-	FrameData, InputEvent, Ready, RecvTimeoutError, TransferFunction,
+	ColourMetadata, ColourPrimaries, Compositor, CompositorConfig, CompositorHandles, DmaBufFrame, Format, Fourcc,
+	Frame, FrameData, InputEvent, Ready, RecvTimeoutError, TransferFunction,
 };
 use smithay::{
 	backend::{
@@ -138,16 +138,19 @@ struct Session {
 
 impl Session {
 	fn start(hdr: bool) -> Self {
-		let _ = tracing_subscriber::fmt()
-			.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-			.with_test_writer()
-			.try_init();
-		let config = CompositorConfig {
+		Self::launch(CompositorConfig {
 			width: WIDTH,
 			height: HEIGHT,
 			hdr,
 			..CompositorConfig::default()
-		};
+		})
+	}
+
+	fn launch(config: CompositorConfig) -> Self {
+		let _ = tracing_subscriber::fmt()
+			.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+			.with_test_writer()
+			.try_init();
 		let (compositor, handles) = Compositor::launch(config).expect("launch compositor");
 		let ready = handles.ready.recv_timeout(READY_TIMEOUT).expect("ready handshake");
 		Self {
@@ -485,8 +488,9 @@ impl Client {
 			self.globals.bind(&qh, 3..=3, ()).expect("zwp_linux_dmabuf_v1");
 		let params = linux_dmabuf.create_params(&qh, ());
 		let modifier = u64::from(dmabuf.format().modifier);
-		for ((fd, offset), stride) in dmabuf.handles().zip(dmabuf.offsets()).zip(dmabuf.strides()) {
-			params.add(fd, 0, offset, stride, (modifier >> 32) as u32, modifier as u32);
+		let planes = dmabuf.handles().zip(dmabuf.offsets()).zip(dmabuf.strides());
+		for (index, ((fd, offset), stride)) in (0u32..).zip(planes) {
+			params.add(fd, index, offset, stride, (modifier >> 32) as u32, modifier as u32);
 		}
 		let buffer = params.create_immed(
 			dmabuf.width() as i32,
@@ -678,7 +682,8 @@ delegate_noop!(State: ignore gamescope_swapchain::GamescopeSwapchain);
 /// `renderer`, in a layout the renderer can render to (NVIDIA's EGL takes a
 /// linear 10-bit buffer only as an external image, which the composite cannot
 /// sample).
-fn dmabuf_cleared_to(renderer: &mut GlesRenderer, colour: [f32; 4]) -> Dmabuf {
+/// A client buffer of `code` in a layout other than linear, cleared to `colour`.
+fn dmabuf_cleared_to(renderer: &mut GlesRenderer, code: SmithayFourcc, colour: [f32; 4]) -> Dmabuf {
 	let file = std::fs::OpenOptions::new()
 		.read(true)
 		.write(true)
@@ -690,12 +695,12 @@ fn dmabuf_cleared_to(renderer: &mut GlesRenderer, colour: [f32; 4]) -> Dmabuf {
 		.egl_context()
 		.dmabuf_render_formats()
 		.iter()
-		.filter(|format| format.code == SmithayFourcc::Xbgr2101010 && format.modifier != Modifier::Linear)
+		.filter(|format| format.code == code && format.modifier != Modifier::Linear)
 		.map(|format| format.modifier)
 		.collect();
 	let buffer = allocator
-		.create_buffer(WIDTH, HEIGHT, SmithayFourcc::Xbgr2101010, &modifiers)
-		.expect("allocate a 10-bit buffer");
+		.create_buffer(WIDTH, HEIGHT, code, &modifiers)
+		.expect("allocate the buffer");
 	let mut dmabuf = buffer.export().expect("export the buffer");
 	let size = Size::<i32, Physical>::from((WIDTH as i32, HEIGHT as i32));
 	let sync = {
@@ -882,7 +887,7 @@ fn an_hdr_game_dmabuf_is_passed_through_with_its_metadata() {
 	let mut reader = Reader::new();
 	let mut client = session.client();
 	client.declare(Declare::WpPq);
-	let buffer = dmabuf_cleared_to(&mut reader.renderer, unorm10(512, 256, 768));
+	let buffer = dmabuf_cleared_to(&mut reader.renderer, SmithayFourcc::Xbgr2101010, unorm10(512, 256, 768));
 	client.present_dmabuf(&buffer);
 
 	// The buffer is opaque, output-sized and alone, so the client's own buffer
@@ -953,4 +958,64 @@ fn sdr_cursor_over_hdr_content_is_drawn_at_the_sdr_white_level() {
 			"the cursor never reached the SDR white level; last: {inside:?}"
 		);
 	}
+}
+
+#[test]
+#[ignore = "requires GPU"]
+fn a_client_dmabuf_is_passed_through_only_in_a_layout_the_embedder_lists() {
+	let mut reader = Reader::new();
+	let colour = [0.25, 0.5, 0.75, 1.0];
+	let buffer = dmabuf_cleared_to(&mut reader.renderer, SmithayFourcc::Xbgr8888, colour);
+	let client = buffer.format();
+	// The renderer's other explicit 8-bit RGB layouts: the pool picks from these.
+	let others: Vec<Format> = reader
+		.renderer
+		.egl_context()
+		.dmabuf_render_formats()
+		.iter()
+		.filter(|format| {
+			matches!(
+				format.code,
+				Fourcc::Abgr8888 | Fourcc::Xbgr8888 | Fourcc::Argb8888 | Fourcc::Xrgb8888
+			) && format.modifier != Modifier::Invalid
+				&& **format != client
+		})
+		.copied()
+		.collect();
+	let launch = |frame_formats: Vec<Format>| {
+		Session::launch(CompositorConfig {
+			width: WIDTH,
+			height: HEIGHT,
+			frame_formats: Some(frame_formats),
+			..CompositorConfig::default()
+		})
+	};
+
+	// Not listed: the client's content arrives composited into a listed layout.
+	let session = launch(others.clone());
+	let mut window = session.client();
+	window.present_dmabuf(&buffer);
+	let frame = loop {
+		let (_, frame) = session.frame_where(|_| true);
+		if close(
+			pixel(&reader.read(&frame), WIDTH as usize / 2, HEIGHT as usize / 2),
+			colour,
+			1.0 / 255.0,
+		) {
+			break frame;
+		}
+	};
+	assert!(others.contains(&frame.dmabuf.format()), "{:?}", frame.dmabuf.format());
+	assert!(frame.acquire_fence.is_some(), "a composited frame is fenced");
+	drop((window, session));
+
+	// Listed: the client's own buffer is handed over.
+	let session = launch([others, vec![client]].concat());
+	let mut window = session.client();
+	window.present_dmabuf(&buffer);
+	let (_, frame) = session.frame_where(|frame| frame.dmabuf.format() == client);
+	assert!(
+		frame.acquire_fence.is_none(),
+		"a passed-through frame has no composite to fence"
+	);
 }
